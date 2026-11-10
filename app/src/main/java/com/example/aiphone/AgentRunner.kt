@@ -1,0 +1,417 @@
+package com.example.aiphone
+
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.SearchManager
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.media.AudioManager
+import android.net.Uri
+import android.os.Build
+import android.provider.AlarmClock
+import android.provider.MediaStore
+import android.provider.Settings
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import org.json.JSONObject
+
+/** The panel subscribes here; every agent line shows in the overlay. */
+object AgentLog {
+    @Volatile
+    var sink: ((String) -> Unit)? = null
+
+    fun emit(line: String) {
+        sink?.invoke(line)
+    }
+}
+
+/** The conversation the model sees, kept between commands. */
+object AgentChat {
+    private val turns = mutableListOf<Pair<String, String>>()
+
+    fun clear() {
+        synchronized(turns) { turns.clear() }
+    }
+
+    fun add(role: String, text: String) {
+        if (text.isBlank()) return
+        synchronized(turns) {
+            turns.add(Pair(role, text))
+            while (turns.size > 16) turns.removeAt(0)
+        }
+    }
+
+    fun snapshot(): List<Pair<String, String>> = synchronized(turns) { turns.toList() }
+}
+
+data class Step(val action: String, val target: String, val count: Int)
+
+private class Plan(val say: String, val steps: List<Step>)
+
+/** Chat with the model and carry out the actions it picks. */
+object AgentRunner {
+    @Volatile
+    private var busy = false
+    @Volatile
+    private var lastScreenshot: String? = null
+
+    private const val MAX_ROUNDS = 3
+    private const val CHANNEL = "ai_phone_agent"
+
+    private val TIKTOK = listOf(
+        "com.zhiliaoapp.musically",
+        "com.ss.android.ugc.trill",
+        "com.zhiliaoapp.musically.go"
+    )
+
+    private val ACTION_LIST =
+        "open: ឈ្មោះ app ឬ package · url: តំណ http · tap: អត្ថបទលើអេក្រង់ · " +
+            "tapxy: \"x,y\" · type: អត្ថបទត្រូវវាយ · enter: ចុចស្វែងរក/ផ្ញើ · " +
+            "scroll: down ឬ up (count) · back · home · recents · notifications · " +
+            "quick: ផ្ទាំងកំណត់រហ័ស · read: អានអេក្រង់ + ថតរូបអេក្រង់ · wait: វិនាទី · " +
+            "notify: សារជូនដំណឹង · volume: up/down/mute (count) · " +
+            "settings: wifi/bluetooth/data/sound/display/battery/apps/accessibility/location · " +
+            "call: លេខ · sms: \"លេខ|សារ\" · search: ពាក្យ · alarm: \"HH:MM\" · " +
+            "map: ទីកន្លែង · camera"
+
+    private val SYSTEM_PROMPT =
+        "អ្នកគឺជាជំនួយការ AI នៅក្នុងទូរស័ព្ទ Android។ អ្នកសន្ទនាជាភាសាខ្មែរ ហើយបញ្ជាទូរស័ព្ទ " +
+            "ជំនួសអ្នកប្រើ។ ឆ្លើយជា JSON តែមួយប៉ុណ្ណោះ គ្មាន Markdown គ្មានអត្ថបទក្រៅ JSON:\n" +
+            "{\"say\":\"ចម្លើយខ្លីជាខ្មែរ\",\"steps\":[{\"action\":\"open\",\"target\":\"tiktok\"}, " +
+            "{\"action\":\"scroll\",\"target\":\"down\",\"count\":20}]}\n" +
+            "say = អ្វីដែលអ្នកនិយាយទៅអ្នកប្រើ។ steps = សកម្មភាពតាមលំដាប់ 0–8។ " +
+            "បើគ្រាន់តែឆ្លើយសំណួរ ទុក steps ទទេ។\n" +
+            "សកម្មភាពដែលមាន — " + ACTION_LIST + "\n" +
+            "ច្បាប់:\n" +
+            "1. បើមិនដឹងអ្វីកំពុងបង្ហាញលើអេក្រង់ ដាក់ {\"action\":\"read\"} ជាជំហានដំបូង រួចរង់ចាំ OBSERVATION។\n" +
+            "2. កុំប្រឌិតកូអរដោណេ — ប្រើ tap ជាមួយអត្ថបទដែលឃើញ។\n" +
+            "3. ឧទាហរណ៍ «បើក tiktok អូស 20» → open tiktok + scroll down 20។\n" +
+            "4. បើសិទ្ធិខ្វះ ឬធ្វើមិនបាន ប្រាប់ត្រង់ៗក្នុង say។"
+
+    fun run(context: Context, command: String, log: (String) -> Unit) {
+        if (busy) {
+            log("⏳ ការងារមួយកំពុងរត់ — រង់ចាំវាចប់សិន")
+            return
+        }
+        busy = true
+        val app = context.applicationContext
+        Thread {
+            try {
+                execute(app, command.trim(), log)
+            } catch (e: Exception) {
+                log("✖ " + (e.message ?: "បរាជ័យ"))
+            } finally {
+                busy = false
+            }
+        }.start()
+    }
+
+    private fun execute(context: Context, command: String, log: (String) -> Unit) {
+        val service = AgentAccessibilityService.instance
+            ?: throw IllegalStateException("Accessibility មិនទាន់បើក — Settings › Accessibility")
+        val size = service.screenSize()
+        log("📐 " + size.first + "×" + size.second + " px")
+        AgentChat.add("user", command)
+
+        if (looksLikeTokens(command)) {
+            val steps = parseTokens(command)
+            log("⚡ បញ្ជាបន្ទាត់ " + steps.size + " ជំហាន")
+            play(context, service, steps, log)
+            log("✔ ចប់")
+            return
+        }
+
+        var observation = ""
+        var round = 0
+        while (round < MAX_ROUNDS) {
+            round += 1
+            log(if (round == 1) "🧠 កំពុងគិត…" else "🔁 មើលអេក្រង់បន្ថែម…")
+            val messages = mutableListOf(Pair("system", SYSTEM_PROMPT))
+            messages.addAll(AgentChat.snapshot())
+            if (observation.isNotEmpty()) {
+                messages.add(Pair("user", "OBSERVATION (អេក្រង់): " + observation +
+                    "\nបន្តបើនៅសល់ ឬឆ្លើយខ្លីៗបើរួចហើយ។"))
+            }
+            val vision = lastScreenshot
+            lastScreenshot = null
+            val reply = GroqClient.chat(context, messages, log, vision)
+            if (!reply.ok) {
+                log("✖ AI: " + reply.text)
+                return
+            }
+            val plan = parsePlan(reply.text)
+            if (plan.say.isNotEmpty()) {
+                log("🤖 " + plan.say)
+            } else if (plan.steps.isEmpty()) {
+                log("🤖 " + reply.text.replace("\n", " ").take(400))
+            }
+            AgentChat.add("assistant", plan.say.ifEmpty { reply.text.take(400) })
+            if (plan.steps.isEmpty()) {
+                log("✔ ចប់")
+                return
+            }
+            observation = play(context, service, plan.steps, log)
+            if (observation.isEmpty()) {
+                log("✔ ចប់")
+                return
+            }
+        }
+        log("✔ ចប់ (អតិបរមា " + MAX_ROUNDS + " ជុំ)")
+    }
+
+    /** Runs the steps; the screen text is returned when one of them reads the screen. */
+    private fun play(context: Context, service: AgentAccessibilityService, steps: List<Step>, log: (String) -> Unit): String {
+        var seen = ""
+        for (step in steps) {
+            when (step.action) {
+                "open" -> {
+                    val pkg = resolve(context, step.target)
+                    if (pkg == null) return fail(log, "រកមិនឃើញ app: " + step.target)
+                    if (!service.openApp(pkg)) return fail(log, "បើក " + pkg + " មិនបាន")
+                    log("📱 បើក " + friendly(context, pkg))
+                    Thread.sleep(2600)
+                }
+                "url" -> {
+                    open(context, Intent(Intent.ACTION_VIEW, Uri.parse(step.target)), log)
+                    Thread.sleep(2000)
+                }
+                "tap" -> {
+                    if (service.tapText(step.target)) log("👆 " + step.target)
+                    else log("✖ រកមិនឃើញ \"" + step.target + "\" លើអេក្រង់")
+                    Thread.sleep(1200)
+                }
+                "tapxy" -> {
+                    val parts = step.target.split(",")
+                    val x = parts.getOrNull(0)?.trim()?.toIntOrNull()
+                    val y = parts.getOrNull(1)?.trim()?.toIntOrNull()
+                    if (x == null || y == null) log("✖ កូអរដោណេខុស: " + step.target)
+                    else {
+                        service.tapAt(x, y)
+                        log("👆 " + x + ", " + y)
+                        Thread.sleep(1200)
+                    }
+                }
+                "type" -> {
+                    if (service.typeText(step.target)) log("⌨ វាយ " + step.target)
+                    else log("✖ គ្មានប្រអប់វាយនៅលើអេក្រង់")
+                    Thread.sleep(900)
+                }
+                "enter" -> {
+                    if (!service.pressEnter()) log("✖ ចុច enter មិនបាន")
+                    Thread.sleep(1200)
+                }
+                "scroll" -> {
+                    val total = step.count.coerceIn(1, 200)
+                    val up = step.target.contains("up") || step.target.contains("ឡើង")
+                    for (i in 1..total) {
+                        val moved = if (up) service.swipeDown() else service.swipeUp()
+                        if (!moved) {
+                            log("✖ អូសមិនបាន — សិទ្ធិ gesture ត្រូវបានបដិសេធ")
+                            break
+                        }
+                        log((if (up) "⬇ " else "⬆ ") + i + "/" + total)
+                        Thread.sleep(1600)
+                    }
+                }
+                "back" -> { service.back(); Thread.sleep(800) }
+                "home" -> { service.home(); Thread.sleep(800) }
+                "recents" -> { service.recents(); Thread.sleep(800) }
+                "notifications" -> { service.notifications(); Thread.sleep(800) }
+                "quick" -> { service.quickSettings(); Thread.sleep(800) }
+                "read" -> {
+                    seen = service.screenText()
+                    lastScreenshot = service.screenshotBase64()
+                    log("👀 " + (if (seen.isEmpty()) "អេក្រង់ទទេ" else seen.take(200)))
+                    if (lastScreenshot != null) log("📸 ថតរូបអេក្រង់")
+                }
+                "wait" -> Thread.sleep((step.count.coerceIn(1, 60) * 1000).toLong())
+                "notify" -> notifyUser(context, step.target.ifEmpty { "រួចរាល់" })
+                "volume" -> volume(context, step.target, step.count)
+                "settings" -> open(context, Intent(settingsAction(step.target)), log)
+                "call" -> open(context, Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + digits(step.target))), log)
+                "sms" -> {
+                    val parts = step.target.split("|")
+                    val number = digits(parts.getOrNull(0).orEmpty())
+                    val body = parts.getOrNull(1)?.trim().orEmpty()
+                    open(context, Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:" + number))
+                        .putExtra("sms_body", body), log)
+                }
+                "search" -> {
+                    val query = step.target.trim()
+                    val intent = Intent(Intent.ACTION_WEB_SEARCH).putExtra(SearchManager.QUERY, query)
+                    if (!open(context, intent, log)) {
+                        open(context, Intent(Intent.ACTION_VIEW,
+                            Uri.parse("https://www.google.com/search?q=" + Uri.encode(query))), log)
+                    }
+                }
+                "alarm" -> {
+                    val parts = step.target.split(":")
+                    val hour = parts.getOrNull(0)?.trim()?.toIntOrNull() ?: 7
+                    val minute = parts.getOrNull(1)?.trim()?.toIntOrNull() ?: 0
+                    open(context, Intent(AlarmClock.ACTION_SET_ALARM)
+                        .putExtra(AlarmClock.EXTRA_HOUR, hour)
+                        .putExtra(AlarmClock.EXTRA_MINUTES, minute)
+                        .putExtra(AlarmClock.EXTRA_SKIP_UI, true), log)
+                }
+                "map" -> open(context, Intent(Intent.ACTION_VIEW,
+                    Uri.parse("geo:0,0?q=" + Uri.encode(step.target))), log)
+                "camera" -> open(context, Intent(MediaStore.ACTION_IMAGE_CAPTURE), log)
+                else -> log("✖ សកម្មភាពមិនស្គាល់: " + step.action)
+            }
+        }
+        return seen
+    }
+
+    private fun fail(log: (String) -> Unit, message: String): String {
+        log("✖ " + message)
+        return ""
+    }
+
+    private fun open(context: Context, intent: Intent, log: (String) -> Unit): Boolean {
+        return try {
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+            true
+        } catch (e: Exception) {
+            log("✖ បើកមិនបាន: " + (e.message ?: "គ្មាន app គាំទ្រ"))
+            false
+        }
+    }
+
+    private fun settingsAction(target: String): String {
+        val low = target.lowercase()
+        return when {
+            low.contains("wifi") || low.contains("wi-fi") -> Settings.ACTION_WIFI_SETTINGS
+            low.contains("blue") -> Settings.ACTION_BLUETOOTH_SETTINGS
+            low.contains("data") -> Settings.ACTION_DATA_ROAMING_SETTINGS
+            low.contains("sound") -> Settings.ACTION_SOUND_SETTINGS
+            low.contains("display") -> Settings.ACTION_DISPLAY_SETTINGS
+            low.contains("battery") -> Settings.ACTION_BATTERY_SAVER_SETTINGS
+            low.contains("app") -> Settings.ACTION_APPLICATION_SETTINGS
+            low.contains("access") -> Settings.ACTION_ACCESSIBILITY_SETTINGS
+            low.contains("location") -> Settings.ACTION_LOCATION_SOURCE_SETTINGS
+            else -> Settings.ACTION_SETTINGS
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun volume(context: Context, target: String, count: Int) {
+        val audio = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val low = target.lowercase()
+        if (low.contains("mute")) {
+            audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, AudioManager.FLAG_SHOW_UI)
+            return
+        }
+        val direction =
+            if (low.contains("down") || low.contains("lower")) AudioManager.ADJUST_LOWER
+            else AudioManager.ADJUST_RAISE
+        for (i in 0 until count.coerceIn(1, 30)) {
+            audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, direction, AudioManager.FLAG_SHOW_UI)
+        }
+    }
+
+    private fun notifyUser(context: Context, text: String) {
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                val channel = NotificationChannel(CHANNEL, "AI Phone", NotificationManager.IMPORTANCE_DEFAULT)
+                (context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+                    .createNotificationChannel(channel)
+            }
+            val note = NotificationCompat.Builder(context, CHANNEL)
+                .setContentTitle("AI Phone")
+                .setContentText(text)
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setAutoCancel(true)
+                .build()
+            NotificationManagerCompat.from(context).notify(91, note)
+        } catch (e: Exception) {
+            AgentLog.emit("✖ ជូនដំណឹងមិនបាន")
+        }
+    }
+
+    private fun digits(value: String): String = value.filter { it.isDigit() || it == '+' }
+
+    private fun looksLikeTokens(command: String): Boolean =
+        Regex("""(?i)\b(OPEN|SCROLL|TAP|TAPXY|TYPE|URL|WAIT|BACK|HOME|READ)\s*:""").containsMatchIn(command)
+
+    private fun parseTokens(command: String): List<Step> {
+        val steps = mutableListOf<Step>()
+        for (token in command.split(Regex("""\s+"""))) {
+            val at = token.indexOf(':')
+            if (at <= 0) continue
+            val key = token.substring(0, at).uppercase()
+            val value = token.substring(at + 1)
+            when (key) {
+                "OPEN" -> steps.add(Step("open", value, 0))
+                "URL" -> steps.add(Step("url", value, 0))
+                "TAP" -> steps.add(Step("tap", value, 0))
+                "TAPXY" -> steps.add(Step("tapxy", value, 0))
+                "TYPE" -> steps.add(Step("type", value, 0))
+                "WAIT" -> steps.add(Step("wait", "", value.toIntOrNull() ?: 2))
+                "SCROLL" -> steps.add(Step("scroll", "down", value.toIntOrNull() ?: 10))
+                "BACK" -> steps.add(Step("back", "", 0))
+                "HOME" -> steps.add(Step("home", "", 0))
+                "READ" -> steps.add(Step("read", "", 0))
+            }
+        }
+        return steps
+    }
+
+    private fun parsePlan(raw: String): Plan {
+        var text = raw.trim()
+        if (text.contains("```")) {
+            text = text.replace("```json", "").replace("```", "").trim()
+        }
+        val start = text.indexOf('{')
+        val end = text.lastIndexOf('}')
+        if (start < 0 || end <= start) return Plan(text.take(400), emptyList())
+        return try {
+            val obj = JSONObject(text.substring(start, end + 1))
+            val array = obj.optJSONArray("steps")
+            val steps = mutableListOf<Step>()
+            if (array != null) {
+                for (i in 0 until array.length()) {
+                    val item = array.optJSONObject(i) ?: continue
+                    val action = item.optString("action").trim().lowercase()
+                    if (action.isEmpty()) continue
+                    steps.add(Step(action, item.optString("target"), item.optInt("count", 0)))
+                }
+            }
+            Plan(obj.optString("say").trim(), steps)
+        } catch (e: Exception) {
+            Plan(text.take(400), emptyList())
+        }
+    }
+
+    private fun resolve(context: Context, target: String): String? {
+        val query = target.trim().lowercase()
+        if (query.isEmpty()) return null
+        if (query.contains("tiktok") || query.contains("tik tok")) {
+            for (pkg in TIKTOK) if (installed(context, pkg)) return pkg
+        }
+        if (installed(context, query)) return query
+        val pm = context.packageManager
+        var best: String? = null
+        for (app in pm.getInstalledApplications(PackageManager.GET_META_DATA)) {
+            if (app.packageName == context.packageName) continue
+            val label = pm.getApplicationLabel(app).toString().lowercase()
+            if (label == query) return app.packageName
+            if (best == null && label.contains(query)) best = app.packageName
+        }
+        return best
+    }
+
+    private fun friendly(context: Context, pkg: String): String = try {
+        val info = context.packageManager.getApplicationInfo(pkg, 0)
+        context.packageManager.getApplicationLabel(info).toString()
+    } catch (e: Exception) {
+        pkg
+    }
+
+    private fun installed(context: Context, pkg: String): Boolean = try {
+        context.packageManager.getPackageInfo(pkg, 0) != null
+    } catch (e: Exception) {
+        false
+    }
+}
